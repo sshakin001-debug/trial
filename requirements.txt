@@ -12,9 +12,14 @@ transformers>=4.35.0
 # DINOv2 / Depth Anything dependencies
 timm>=0.9.0
 einops>=0.7.0
+omegaconf>=2.3.0
+xformers>=0.0.25
 
 # Optional: for point cloud export
 open3d>=0.17.0
 tqdm>=4.65.0
+
+# Optional: for HEIC image conversion (iPhone images)
+pillow-heif>=0.15.0
 
 # NOTE: zoedepth is embedded in ./zoedepth/ - no pip install needed!
