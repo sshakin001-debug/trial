@@ -13,11 +13,12 @@ from PIL import Image
 import torchvision.transforms as transforms
 import sys
 
-_ZOEDEPTH_ROOT = Path(__file__).parent.parent.parent / "zoedepth"
-if str(_ZOEDEPTH_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ZOEDEPTH_ROOT))
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+    print(f"[DepthEstimator] Added to sys.path: {_REPO_ROOT}")
 
-_TORCHHUB_ROOT = Path(__file__).parent.parent.parent / "torchhub"
+_TORCHHUB_ROOT = _REPO_ROOT / "torchhub"
 if str(_TORCHHUB_ROOT) not in sys.path:
     sys.path.insert(0, str(_TORCHHUB_ROOT))
 
