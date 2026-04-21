@@ -1,243 +1,247 @@
-﻿import argparse
+"""
+Unified batch processor: YOLO + SegFormer + Metric Depth + Lateral Fusion.
+Generates JSON annotations with 3D lateral positions.
+"""
+
+import argparse
 from pathlib import Path
 import json
 import numpy as np
 import cv2
+from typing import Dict, Any
+
 from yolo_inference import YOLOVehicleSegmenter
 from segformer_inference import SegformerLaneSegmenter
-from depth_inference import DepthInferencer
-from depth_fusion import DepthFusion
+from depth_estimator import MetricDepthEstimator
+from lateral_fusion import LateralPositionFusion
 
-class BatchProcessor:
-    """"Process all frames with YOLO, SegFormer, and Depth models and combine annotations"""
+
+class UnifiedBatchProcessor:
+    """
+    Single-pass processor integrating all models with metric depth.
+    """
     
-    def __init__(self, yolo_model_path: str, segformer_model_path: str, 
-                 calibration_path: str, device: str = 'cuda',
-                 segformer_img_size: tuple = (512, 512),
-                 depth_checkpoint_path: str = None):
-        self.yolo_segmenter = YOLOVehicleSegmenter(yolo_model_path, device)
-        self.segformer_segmenter = SegformerLaneSegmenter(
-            segformer_model_path, device, segformer_img_size
-        )
+    def __init__(self,
+                 yolo_model_path: str,
+                 segformer_model_path: str,
+                 depth_checkpoint_path: str,
+                 calibration_path: str,
+                 dataset: str = 'kitti',
+                 device: str = 'cuda',
+                 segformer_img_size: tuple = (512, 512)):
+        """
+        Initialize all pipeline components.
+        """
+        print("=" * 50)
+        print("UNIFIED DATASET CREATION PIPELINE")
+        print("=" * 50)
         
-        # Initialize depth model if checkpoint provided
-        self.depth_inferencer = None
-        if depth_checkpoint_path and Path(depth_checkpoint_path).exists():
-            self.depth_inferencer = DepthInferencer(
-                depth_checkpoint_path, device, dataset='kitti'
+        print("\n[1/4] Loading YOLO vehicle segmenter...")
+        self.yolo = YOLOVehicleSegmenter(yolo_model_path, device)
+        
+        print("\n[2/4] Loading SegFormer lane segmenter...")
+        self.segformer = SegformerLaneSegmenter(segformer_model_path, device, segformer_img_size)
+        
+        print("\n[3/4] Loading metric depth estimator...")
+        self.depth = MetricDepthEstimator(depth_checkpoint_path, dataset, device, calibration_path)
+        
+        print("\n[4/4] Initializing lateral fusion...")
+        self.fusion = LateralPositionFusion(self.depth.calibration)
+        
+        print("\n" + "=" * 50)
+        print("READY")
+        print("=" * 50)
+    
+    def process_frame(self, image: np.ndarray, frame_name: str = "") -> Dict[str, Any]:
+        """
+        Process single frame through all pipelines.
+        """
+        h, w = image.shape[:2]
+        original_size = (w, h)
+        
+        yolo_results = self.yolo.segment_frame(image)
+        segformer_results = self.segformer.segment_frame(image)
+        depth_map = self.depth.estimate(image, original_size)
+        
+        lane_markings_3d = []
+        for i, marking in enumerate(segformer_results.get('lane_markings', [])):
+            lane_3d = self.fusion.compute_lane_3d(
+                marking['start'], marking['end'], depth_map
             )
-            print(f"Loaded depth model from {depth_checkpoint_path}")
+            lane_markings_3d.append({
+                'marking_id': i,
+                'start_pixel': marking['start'],
+                'end_pixel': marking['end'],
+                **lane_3d
+            })
         
-        # Load calibration
-        calib_data = np.load(calibration_path)
-        self.calibration = {
-            'camera_matrix': calib_data['camera_matrix'].tolist(),
-            'distortion_coefficients': calib_data['distortion_coefficients'].tolist(),
-            'optimal_camera_matrix': calib_data['optimal_camera_matrix'].tolist(),
-            'image_size': calib_data['image_size'].tolist()
+        vehicles_3d = []
+        for i, (mask, box, cls, cls_name, conf) in enumerate(zip(
+            yolo_results.get('masks', []),
+            yolo_results.get('boxes', []),
+            yolo_results.get('classes', []),
+            yolo_results.get('class_names', []),
+            yolo_results.get('confidences', [])
+        )):
+            vehicle_3d = self.fusion.compute_vehicle_3d(box, mask, depth_map)
+            
+            lane_info = self.fusion.assign_lane(vehicle_3d, lane_markings_3d)
+            
+            vehicles_3d.append({
+                'vehicle_id': i,
+                'class_name': cls_name,
+                'class_id': int(cls),
+                'confidence': float(conf),
+                'bbox': [float(x) for x in box],
+                **vehicle_3d,
+                'lane_relative': lane_info
+            })
+        
+        ego_lane = self.fusion.compute_ego_lane(lane_markings_3d)
+        
+        return {
+            'frame_name': frame_name,
+            'image_size': {'width': w, 'height': h},
+            'ego_vehicle': {
+                'lane_state': ego_lane,
+                'camera_height_m': self.fusion.camera_height_m
+            },
+            'vehicles': vehicles_3d,
+            'lanes': {
+                'markings_3d': lane_markings_3d,
+                'count': len(lane_markings_3d)
+            },
+            'calibration': {
+                'fx': self.depth.calibration['fx'],
+                'fy': self.depth.calibration['fy'],
+                'cx': self.depth.calibration['cx'],
+                'cy': self.depth.calibration['cy']
+            }
         }
-        
-        # Initialize depth fusion with camera calibration
-        self.depth_fusion = DepthFusion(self.calibration)
     
-    def process_dataset(self, frames_dir: Path, output_dir: Path) -> dict:
-        """Process entire dataset - uses single-pass method if depth model available"""
-        if self.depth_inferencer is not None:
-            return self._process_dataset_single_pass(frames_dir, output_dir)
-        else:
-            return self._process_dataset_legacy(frames_dir, output_dir)
-    
-    def _process_dataset_single_pass(self, frames_dir: Path, output_dir: Path) -> dict:
-        """Process each frame through all three models in a single pass"""
+    def process_dataset(self, frames_dir: Path, output_dir: Path) -> Dict[str, Any]:
+        """
+        Process entire dataset directory.
+        """
         frames_dir = Path(frames_dir)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Create subdirectories
-        vehicles_dir = output_dir / 'vehicles'
-        lanes_dir = output_dir / 'lanes'
+        json_dir = output_dir / 'annotations'
+        vis_dir = output_dir / 'visualizations'
         depth_dir = output_dir / 'depth_maps'
         
-        vehicles_dir.mkdir(exist_ok=True)
-        lanes_dir.mkdir(exist_ok=True)
-        depth_dir.mkdir(exist_ok=True)
+        for d in [json_dir, vis_dir, depth_dir]:
+            d.mkdir(exist_ok=True)
         
-        print("=" * 50)
-        print("Processing all frames with YOLO, SegFormer, and Depth...")
-        print("=" * 50)
-        
-        # Get all frame paths
         frame_paths = sorted(frames_dir.glob('*.jpg')) + \
                       sorted(frames_dir.glob('*.png')) + \
                       sorted(frames_dir.glob('*.jpeg'))
         
-        combined_annotations = {
-            'frames': {},
+        print(f"\nProcessing {len(frame_paths)} frames...")
+        
+        all_annotations = {
             'metadata': {
                 'total_frames': len(frame_paths),
-                'with_depth': True
-            }
+                'pipeline': 'unified_depth_lateral_v1',
+                'depth_model': 'zoedepth_metric',
+                'dataset_type': self.depth.dataset
+            },
+            'frames': {}
         }
         
         for frame_path in frame_paths:
-            print(f"Processing {frame_path.name}...")
+            print(f"  Processing {frame_path.name}...")
             
-            # Read image
             image = cv2.imread(str(frame_path))
             if image is None:
                 continue
             
-            original_size = (image.shape[1], image.shape[0])
+            annotation = self.process_frame(image, frame_path.name)
             
-            # Run YOLO
-            yolo_results = self.yolo_segmenter.segment_frame(image)
-            
-            # Run SegFormer
-            segformer_results = self.segformer_segmenter.segment_frame(image)
-            
-            # Run Depth
-            depth_map = self.depth_inferencer.infer_depth(image, original_size)
-            
-            # Save depth map
             depth_path = depth_dir / f"{frame_path.stem}_depth.npy"
-            np.save(str(depth_path), depth_map)
+            np.save(str(depth_path), self.depth.estimate(image))
             
-            # Save vehicle masks
-            mask_paths = []
-            for i, mask in enumerate(yolo_results['masks']):
-                mask_path = vehicles_dir / f"{frame_path.stem}_vehicle_{i:03d}.png"
-                cv2.imwrite(str(mask_path), mask * 255)
-                mask_paths.append(str(mask_path))
+            json_path = json_dir / f"{frame_path.stem}.json"
+            with open(json_path, 'w') as f:
+                json.dump(annotation, f, indent=2, cls=NumpyEncoder)
             
-            # Save lane masks
-            pavement_mask_path = lanes_dir / f"{frame_path.stem}_pavement.png"
-            lane_mask_path = lanes_dir / f"{frame_path.stem}_lane.png"
-            cv2.imwrite(str(pavement_mask_path), segformer_results['pavement_mask'] * 255)
-            cv2.imwrite(str(lane_mask_path), segformer_results['lane_mask'] * 255)
+            vis = self._visualize(image, annotation)
+            cv2.imwrite(str(vis_dir / f"{frame_path.stem}_vis.jpg"), vis)
             
-            # Fuse with depth
-            frame_annotations = self.depth_fusion.fuse_frame(
-                vehicle_masks=yolo_results['masks'],
-                vehicle_boxes=yolo_results['boxes'],
-                vehicle_classes=yolo_results['classes'],
-                vehicle_class_names=yolo_results['class_names'],
-                vehicle_confidences=yolo_results['confidences'],
-                vehicle_mask_paths=mask_paths,
-                lane_markings=segformer_results['lane_markings'],
-                pavement_mask=segformer_results['pavement_mask'],
-                depth_map=depth_map
-            )
-            
-            # Add depth map path
-            frame_annotations['depth_map_path'] = str(depth_path)
-            
-            # Add lane mask paths
-            frame_annotations['lane_mask_paths'] = {
-                'pavement': str(pavement_mask_path),
-                'lane': str(lane_mask_path)
-            }
-            
-            combined_annotations['frames'][frame_path.name] = frame_annotations
+            all_annotations['frames'][frame_path.name] = annotation
         
-        # Add calibration
-        combined_annotations['calibration'] = self.calibration
+        with open(output_dir / 'dataset_annotations.json', 'w') as f:
+            json.dump(all_annotations, f, indent=2, cls=NumpyEncoder)
         
-        # Save combined annotations
-        with open(output_dir / 'combined_annotations.json', 'w') as f:
-            json.dump(combined_annotations, f, indent=2)
-        
-        print(f"\nDataset processing complete. Output saved to {output_dir}")
-        return combined_annotations
+        print(f"\nComplete! Output: {output_dir}")
+        return all_annotations
     
-    def _process_dataset_legacy(self, frames_dir: Path, output_dir: Path) -> dict:
-        """Legacy processing - separate passes for each model"""
-        frames_dir = Path(frames_dir)
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+    def _visualize(self, image: np.ndarray, ann: Dict[str, Any]) -> np.ndarray:
+        """Create visualization with 3D annotations."""
+        vis = image.copy()
         
-        print("=" * 50)
-        print("Processing vehicles with YOLO...")
-        print("=" * 50)
-        vehicle_output_dir = output_dir / 'vehicles'
-        vehicle_annotations = self.yolo_segmenter.process_video_frames(
-            frames_dir, vehicle_output_dir
-        )
+        for m in ann['lanes']['markings_3d']:
+            s = m['start_pixel']
+            e = m['end_pixel']
+            cv2.line(vis, tuple(s), tuple(e), (0, 255, 255), 2)
+            label = f"x={m['lateral_offset_start_m']:.1f}m"
+            cv2.putText(vis, label, (s[0], s[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
         
-        print("\n" + "=" * 50)
-        print("Processing lanes with SegFormer...")
-        print("=" * 50)
-        lane_output_dir = output_dir / 'lanes'
-        lane_annotations = self.segformer_segmenter.process_video_frames(
-            frames_dir, lane_output_dir
-        )
+        for v in ann['vehicles']:
+            bbox = v['bbox']
+            x1, y1, x2, y2 = map(int, bbox)
+            
+            lane = v.get('lane_relative', {}).get('lane_assignment', 'unknown')
+            color = {'same': (0, 255, 0), 'left': (255, 0, 0), 
+                     'right': (0, 0, 255), 'unknown': (128, 128, 128)}.get(lane, (128, 128, 128))
+            
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            
+            z = v['ground_contact']['longitudinal_z_m']
+            x = v['lateral_offset_from_ego_m']
+            text = f"{v['class_name']} Z={z:.1f}m X={x:+.1f}m [{lane}]"
+            cv2.putText(vis, text, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
-        print("\n" + "=" * 50)
-        print("Combining annotations...")
-        print("=" * 50)
-        combined_annotations = self._combine_annotations(
-            vehicle_annotations, lane_annotations
-        )
+        ego = ann['ego_vehicle']['lane_state']
+        info = f"Ego: {ego.get('current_lane', '?')} | offset={ego.get('lateral_offset_from_center_m', 0):.2f}m"
+        cv2.putText(vis, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
-        # Add calibration to combined annotations
-        combined_annotations['calibration'] = self.calibration
-        
-        # Save combined annotations
-        with open(output_dir / 'combined_annotations.json', 'w') as f:
-            json.dump(combined_annotations, f, indent=2)
-        
-        print(f"\nDataset processing complete. Output saved to {output_dir}")
-        return combined_annotations
-    
-    def _combine_annotations(self, vehicle_anns: dict, lane_anns: dict) -> dict:
-        """"Combine vehicle and lane annotations for each frame"""
-        combined = {
-            'frames': {},
-            'metadata': {
-                'total_frames': len(vehicle_anns),
-                'processing_timestamp': str(Path.cwd())
-            }
-        }
-        
-        for frame_name in vehicle_anns:
-            if frame_name in lane_anns:
-                combined['frames'][frame_name] = {
-                    'vehicles': vehicle_anns[frame_name],
-                    'lanes': lane_anns[frame_name]
-                }
-        
-        return combined
+        return vis
+
+
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Batch process dataset with YOLO, SegFormer, and Depth')
-    parser.add_argument('--frames_dir', type=str, required=True,
-                        help='Directory containing input frames')
-    parser.add_argument('--output_dir', type=str, required=True,
-                        help='Output directory for processed dataset')
-    parser.add_argument('--yolo_model', type=str, required=True,
-                        help='Path to YOLO11 model checkpoint (.pt)')
-    parser.add_argument('--segformer_model', type=str, required=True,
-                        help='Path to SegFormer model checkpoint (.pth)')
-    parser.add_argument('--calibration', type=str, required=True,
-                        help='Path to camera calibration NPZ file')
-    parser.add_argument('--depth_checkpoint', type=str, default=None,
-                        help='Path to Depth Anything checkpoint (.pt) for 3D depth')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to use for inference')
-    parser.add_argument('--segformer_img_size', type=int, nargs=2, default=[512, 512],
-                        help='Image size used for SegFormer training (height width)')
+    parser = argparse.ArgumentParser(description='Unified Dataset Creation')
+    parser.add_argument('--frames_dir', required=True)
+    parser.add_argument('--output_dir', required=True)
+    parser.add_argument('--yolo_model', required=True)
+    parser.add_argument('--segformer_model', required=True)
+    parser.add_argument('--depth_checkpoint', required=True)
+    parser.add_argument('--calibration', required=True)
+    parser.add_argument('--dataset', default='kitti', choices=['kitti', 'nyu'])
+    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--segformer_img_size', type=int, nargs=2, default=[512, 512])
     
     args = parser.parse_args()
     
-    processor = BatchProcessor(
-        args.yolo_model,
-        args.segformer_model,
-        args.calibration,
-        args.device,
-        tuple(args.segformer_img_size),
-        args.depth_checkpoint
+    processor = UnifiedBatchProcessor(
+        args.yolo_model, args.segformer_model, args.depth_checkpoint,
+        args.calibration, args.dataset, args.device, tuple(args.segformer_img_size)
     )
     
     processor.process_dataset(Path(args.frames_dir), Path(args.output_dir))
+
 
 if __name__ == '__main__':
     main()

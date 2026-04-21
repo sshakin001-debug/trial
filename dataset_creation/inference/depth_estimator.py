@@ -1,0 +1,177 @@
+"""
+Standalone metric depth estimator using ZoeDepth architecture.
+No external image-to-pcd dependency required.
+"""
+
+import torch
+import torch.nn as nn
+import numpy as np
+import cv2
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
+from PIL import Image
+import torchvision.transforms as transforms
+
+try:
+    import sys
+    _possible_roots = [
+        Path(__file__).parent.parent.parent / "image-to-pcd",
+        Path(__file__).parent.parent.parent / "zoedepth",
+        Path.cwd() / "image-to-pcd",
+        Path.cwd() / "zoedepth",
+    ]
+    for _root in _possible_roots:
+        if _root.exists() and str(_root) not in sys.path:
+            sys.path.insert(0, str(_root))
+    
+    from zoedepth.models.builder import build_model
+    from zoedepth.utils.config import get_config
+    ZOE_AVAILABLE = True
+except ImportError:
+    ZOE_AVAILABLE = False
+    print("Warning: ZoeDepth not found. Using simplified depth estimation.")
+
+
+class MetricDepthEstimator:
+    """
+    Metric depth estimation for outdoor/indoor scenes.
+    Wraps ZoeDepth with image-to-pcd's calibration-aware backprojection.
+    """
+    
+    def __init__(self,
+                 checkpoint_path: str,
+                 dataset: str = 'kitti',
+                 device: str = 'cuda',
+                 calibration_path: Optional[str] = None):
+        """
+        Args:
+            checkpoint_path: Path to .pt checkpoint file
+            dataset: 'kitti' (outdoor, 0-80m) or 'nyu' (indoor, 0-10m)
+            device: 'cuda' or 'cpu'
+            calibration_path: Path to .npz with Camera_matrix, distCoeff
+        """
+        self.device = device if torch.cuda.is_available() else 'cpu'
+        self.dataset = dataset.lower()
+        
+        self.calibration = self._load_calibration(calibration_path) if calibration_path else None
+        
+        if ZOE_AVAILABLE:
+            self.model = self._build_zoedepth(checkpoint_path)
+        else:
+            self.model = None
+            print("WARNING: Running without depth model. Using dummy depths.")
+        
+        print(f"[DepthEstimator] Dataset: {dataset}, Device: {self.device}")
+        if self.calibration:
+            print(f"  Calibration: fx={self.calibration['fx']:.1f}, "
+                  f"fy={self.calibration['fy']:.1f}, "
+                  f"cx={self.calibration['cx']:.1f}, "
+                  f"cy={self.calibration['cy']:.1f}")
+    
+    def _build_zoedepth(self, checkpoint_path: str):
+        """Build ZoeDepth model using image-to-pcd's config system."""
+        config = get_config("zoedepth", "eval", self.dataset)
+        
+        if not checkpoint_path.startswith(('local::', 'url::')):
+            checkpoint_path = f"local::{checkpoint_path}"
+        
+        config.pretrained_resource = checkpoint_path
+        
+        model = build_model(config)
+        model.to(self.device)
+        model.eval()
+        return model
+    
+    def _load_calibration(self, path: str) -> Dict[str, Any]:
+        """Load image-to-pcd style calibration NPZ."""
+        data = np.load(path)
+        K = data['Camera_matrix']
+        
+        return {
+            'camera_matrix': K,
+            'fx': float(K[0, 0]),
+            'fy': float(K[1, 1]),
+            'cx': float(K[0, 2]),
+            'cy': float(K[1, 2]),
+            'dist_coeffs': data.get('distCoeff', np.zeros(5)),
+        }
+    
+    def estimate(self, image: np.ndarray, original_size: Optional[Tuple[int, int]] = None) -> np.ndarray:
+        """
+        Estimate metric depth map.
+        
+        Args:
+            image: BGR image (H, W, 3)
+            original_size: (W, H) to resize output to
+            
+        Returns:
+            depth_map: (H, W) float32 array in meters
+        """
+        if original_size is None:
+            original_size = (image.shape[1], image.shape[0])
+        
+        if self.model is None:
+            h, w = original_size[1], original_size[0]
+            return np.ones((h, w), dtype=np.float32) * 10.0
+        
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        tensor = transforms.ToTensor()(pil).unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            pred = self.model(tensor, dataset=self.dataset)
+        
+        if isinstance(pred, dict):
+            pred = pred.get('metric_depth', pred.get('out'))
+        elif isinstance(pred, (list, tuple)):
+            pred = pred[-1]
+        
+        depth = pred.squeeze().cpu().numpy()
+        
+        if depth.shape != (original_size[1], original_size[0]):
+            depth_pil = Image.fromarray(depth)
+            depth = np.array(depth_pil.resize(original_size, Image.NEAREST))
+        
+        return depth.astype(np.float32)
+    
+    def backproject(self, depth_map: np.ndarray) -> np.ndarray:
+        """
+        Backproject depth map to 3D point cloud using camera intrinsics.
+        Uses image-to-pcd's formula: X = (u-cx)*Z/fx, Y = (v-cy)*Z/fy, Z = depth
+        
+        Args:
+            depth_map: (H, W) metric depth
+            
+        Returns:
+            points: (N, 3) array of 3D points [X_right, Y_down, Z_forward]
+        """
+        if self.calibration is None:
+            raise ValueError("Camera calibration required for backprojection")
+        
+        h, w = depth_map.shape
+        fx, fy = self.calibration['fx'], self.calibration['fy']
+        cx, cy = self.calibration['cx'], self.calibration['cy']
+        
+        u, v = np.meshgrid(np.arange(w), np.arange(h))
+        
+        Z = depth_map
+        X = (u - cx) * Z / fx
+        Y = (v - cy) * Z / fy
+        
+        points = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+        
+        valid = (Z.reshape(-1) > 0.1) & np.isfinite(Z.reshape(-1))
+        return points[valid]
+    
+    def pixel_to_3d(self, u: float, v: float, depth: float) -> Tuple[float, float, float]:
+        """Convert single pixel + depth to 3D camera coordinates."""
+        if self.calibration is None:
+            raise ValueError("Calibration required")
+        
+        fx, fy = self.calibration['fx'], self.calibration['fy']
+        cx, cy = self.calibration['cx'], self.calibration['cy']
+        
+        X = (u - cx) * depth / fx
+        Y = (v - cy) * depth / fy
+        Z = depth
+        return X, Y, Z
