@@ -11,20 +11,23 @@ import cv2
 class DepthInferencer:
     """Depth inference using Depth Anything / ZoeDepth for metric depth estimation"""
     
-    def __init__(self, checkpoint_path: str, device: str = 'cuda', dataset: str = 'kitti'):
+    def __init__(self, checkpoint_path: str, device: str = 'cuda', dataset: str = 'kitti',
+                 image_to_pcd_root: Optional[str] = None):
         """
         Args:
             checkpoint_path: Path to the depth model checkpoint (.pt file)
             device: 'cuda' or 'cpu'
             dataset: 'kitti' for outdoor (0-80m), 'nyu' for indoor (0-10m)
+            image_to_pcd_root: Optional path to image-to-pcd module
         """
         self.device = device
         self.dataset = dataset
         
         # Add the image-to-pcd path to sys.path if needed
-        image_to_pcd_path = Path("D:/Point_cloud/image-to-pcd")
-        if str(image_to_pcd_path) not in sys.path:
-            sys.path.insert(0, str(image_to_pcd_path))
+        if image_to_pcd_root:
+            image_to_pcd_path = Path(image_to_pcd_root)
+            if str(image_to_pcd_path) not in sys.path:
+                sys.path.insert(0, str(image_to_pcd_path))
         
         # Import zoedepth components
         from zoedepth.models.builder import build_model
@@ -32,7 +35,10 @@ class DepthInferencer:
         
         # Build model configuration
         config = get_config("zoedepth", "eval", dataset)
-        config.pretrained_resource = f'local::{checkpoint_path}'
+        if not checkpoint_path.startswith('local::') and not checkpoint_path.startswith('url::'):
+            config.pretrained_resource = f'local::{checkpoint_path}'
+        else:
+            config.pretrained_resource = checkpoint_path
         
         # Build and load the model
         self.model = build_model(config)
@@ -89,9 +95,12 @@ class DepthInferencer:
         
         # Only resize if dimensions differ
         if h != orig_h or w != orig_w:
-            pred_resized = cv2.resize(pred, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+            pred_pil = Image.fromarray(pred)
+            pred_resized = np.array(
+                pred_pil.resize((orig_w, orig_h), Image.NEAREST)
+            ).astype(np.float32)
         else:
-            pred_resized = pred
+            pred_resized = pred.astype(np.float32)
         
         return pred_resized.astype(np.float32)
     
