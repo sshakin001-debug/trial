@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional
 import re
 
 
-def load_checkpoint(checkpoint_path: str, map_location: str = 'cpu', strict: bool = True) -> Dict[str, Any]:
+def load_checkpoint(checkpoint_path: str, map_location: str = 'cpu', strict: bool = False) -> Dict[str, Any]:
     """
     Load checkpoint from path.
     
@@ -32,7 +32,7 @@ def load_checkpoint(checkpoint_path: str, map_location: str = 'cpu', strict: boo
 
 
 def load_local_checkpoint(checkpoint_path: str, model: nn.Module, 
-                        strict: bool = True, key: str = 'model') -> nn.Module:
+                         strict: bool = False, key: str = 'model') -> nn.Module:
     """
     Load weights into model from local checkpoint.
     

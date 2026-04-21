@@ -270,32 +270,30 @@ class SegformerLaneSegmenter:
         
         return cv2.cvtColor(color_seg, cv2.COLOR_RGB2BGR)
     
-    def _create_visualization(self, image: np.ndarray, results: Dict[str, Any]) -> np.ndarray:
+def _create_visualization(self, image: np.ndarray, results: Dict[str, Any]) -> np.ndarray:
         """"Create visualization of lane segmentation"""
         vis_image = image.copy()
         
-        # Create overlay for pavement (purple/blue tint)
+        # Pavement overlay (purple)
         pavement_overlay = np.zeros_like(vis_image)
-        pavement_overlay[results['pavement_mask'] > 0] = [128, 0, 128]  # Purple in BGR
+        pavement_overlay[results['pavement_mask'] > 0] = [128, 0, 128]
         vis_image = cv2.addWeighted(vis_image, 1.0, pavement_overlay, 0.4, 0)
         
-        # Create overlay for lane markings (yellow)
+        # Lane marking overlay (yellow fill)
         lane_overlay = np.zeros_like(vis_image)
-        lane_overlay[results['lane_mask'] > 0] = [0, 255, 255]  # Yellow in BGR
+        lane_overlay[results['lane_mask'] > 0] = [0, 255, 255]
         vis_image = cv2.addWeighted(vis_image, 1.0, lane_overlay, 0.6, 0)
         
-        # Draw extracted lane lines (red for clarity)
-        for marking in results['lane_markings']:
-            start = tuple(marking['start'])
-            end = tuple(marking['end'])
-            cv2.line(vis_image, start, end, (0, 0, 255), 2)
+        # Draw lane mask contours only — NO extended fitted lines
+        lane_contours, _ = cv2.findContours(
+            results['lane_mask'], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(vis_image, lane_contours, -1, (0, 255, 255), 2)
         
-        # Add legend
-        cv2.putText(vis_image, "Pavement", (10, 30), 
+        # Legend
+        cv2.putText(vis_image, "Pavement", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 0, 128), 2)
-        cv2.putText(vis_image, "Lane Markings", (10, 60), 
+        cv2.putText(vis_image, "Lane Markings", (10, 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(vis_image, "Detected Lines", (10, 90), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
         return vis_image

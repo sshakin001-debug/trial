@@ -9,8 +9,8 @@ from ultralytics import YOLO
 class YOLOVehicleSegmenter:
     """"YOLO11-based vehicle segmentation for Bangladeshi vehicles"""
     
-    def __init__(self, model_path: str, device: str = 'cuda', 
-                 confidence_threshold: float = 0.5):
+def __init__(self, model_path: str, device: str = 'cuda', 
+                 confidence_threshold: float = 0.25):
         """""
         Args:
             model_path: Path to YOLO11 model checkpoint (.pt file)

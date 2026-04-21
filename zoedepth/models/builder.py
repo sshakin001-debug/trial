@@ -13,7 +13,7 @@ from zoedepth.utils.config import get_config
 from zoedepth.models.depth_model import DepthModel
 
 
-def load_checkpoint(checkpoint_path: str, model: nn.Module, strict: bool = True) -> nn.Module:
+def load_checkpoint(checkpoint_path: str, model: nn.Module, strict: bool = False) -> nn.Module:
     """Load checkpoint from local path."""
     if checkpoint_path.startswith('local::'):
         checkpoint_path = checkpoint_path[7:]
