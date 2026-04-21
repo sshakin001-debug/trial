@@ -49,7 +49,7 @@ def build_model(config, device: str = 'cuda') -> DepthModel:
     use_depth_anything = config.model.get('use_depth_anything', False)
     
     if use_depth_anything:
-        from zoedepth.models.zoedepth.zoedepth_v1 import ZoeDepth AnythingV1
+        from zoedepth.models.zoedepth.zoedepth_v1 import ZoeDepthAnythingV1
         model = ZoeDepthAnythingV1(config)
     elif 'nk' in version.lower():
         from zoedepth.models.zoedepth_nk.zoedepth_nk_v1 import ZoeDepthNKV1
