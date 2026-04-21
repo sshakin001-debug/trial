@@ -8,15 +8,18 @@ import glob
 class CameraCalibrator:
     """Camera calibration using checkerboard patterns"""
     
-    def __init__(self, checkerboard_size: Tuple[int, int] = (9, 6), 
-                 square_size: float = 0.025):
+    def __init__(self, checkerboard_size: Tuple[int, int] = (8, 6), 
+                 square_size: float = 0.08,
+                 max_image_dimension: int = 2000):
         """
         Args:
             checkerboard_size: Number of inner corners (width, height)
             square_size: Size of checkerboard squares in meters
+            max_image_dimension: Maximum width/height in pixels before downscaling
         """
         self.checkerboard_size = checkerboard_size
         self.square_size = square_size
+        self.max_image_dimension = max_image_dimension
         self.criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
         
         # Prepare object points
@@ -25,16 +28,37 @@ class CameraCalibrator:
                                     0:checkerboard_size[1]].T.reshape(-1, 2)
         self.objp *= square_size
         
+    def _resize_if_needed(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
+        """Resize image if it exceeds max dimension while maintaining aspect ratio"""
+        h, w = image.shape[:2]
+        max_dim = max(h, w)
+        
+        if max_dim <= self.max_image_dimension:
+            return image, 1.0
+        
+        scale = self.max_image_dimension / max_dim
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        return resized, scale
+    
     def detect_checkerboard(self, image: np.ndarray) -> Tuple[bool, Optional[np.ndarray], 
                                                                Optional[np.ndarray]]:
         """Detect checkerboard corners in image"""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Resize high-resolution images before detection
+        resized_image, scale = self._resize_if_needed(image)
+        
+        gray = cv2.cvtColor(resized_image, cv2.COLOR_BGR2GRAY)
         ret, corners = cv2.findChessboardCorners(gray, self.checkerboard_size, None)
         
         if ret:
             corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), self.criteria)
-            return True, corners2, gray.shape[::-1]
-        return False, None, None
+            # Scale corners back to original image coordinates
+            if scale != 1.0:
+                corners2 = corners2 / scale
+            return True, corners2, image.shape[:2][::-1]  # Use original image size
+        return False, None, image.shape[:2][::-1]
     
     def calibrate_from_images(self, image_paths: List[str]) -> Dict[str, Any]:
         """Perform camera calibration from multiple checkerboard images"""
@@ -141,9 +165,14 @@ def main():
     parser.add_argument('--output', default='calibration.npz', help='Output calibration file')
     parser.add_argument('--checkerboard_size', nargs=2, type=int, default=[9,6], help='Checkerboard size (width height)')
     parser.add_argument('--square_size', type=float, default=0.025, help='Square size in meters')
+    parser.add_argument('--max_dimension', type=int, default=2000, help='Max image dimension before downscaling')
     args = parser.parse_args()
 
-    calibrator = CameraCalibrator(tuple(args.checkerboard_size), args.square_size)
+    calibrator = CameraCalibrator(
+        tuple(args.checkerboard_size), 
+        args.square_size,
+        max_image_dimension=args.max_dimension
+    )
     image_paths = glob.glob(f'{args.image_dir}/*.jpg') + glob.glob(f'{args.image_dir}/*.png')
     if not image_paths:
         print("No images found")
