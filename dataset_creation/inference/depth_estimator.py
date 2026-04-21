@@ -1,6 +1,6 @@
 """
-Standalone metric depth estimator using ZoeDepth architecture.
-No external image-to-pcd dependency required.
+Standalone metric depth estimator using embedded ZoeDepth+DepthAnything.
+No external pip dependency required - all code is vendored in repo.
 """
 
 import torch
@@ -11,31 +11,24 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 from PIL import Image
 import torchvision.transforms as transforms
+import sys
 
-try:
-    import sys
-    _possible_roots = [
-        Path(__file__).parent.parent.parent / "image-to-pcd",
-        Path(__file__).parent.parent.parent / "zoedepth",
-        Path.cwd() / "image-to-pcd",
-        Path.cwd() / "zoedepth",
-    ]
-    for _root in _possible_roots:
-        if _root.exists() and str(_root) not in sys.path:
-            sys.path.insert(0, str(_root))
-    
-    from zoedepth.models.builder import build_model
-    from zoedepth.utils.config import get_config
-    ZOE_AVAILABLE = True
-except ImportError:
-    ZOE_AVAILABLE = False
-    print("Warning: ZoeDepth not found. Using simplified depth estimation.")
+_ZOEDEPTH_ROOT = Path(__file__).parent.parent.parent / "zoedepth"
+if str(_ZOEDEPTH_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ZOEDEPTH_ROOT))
+
+_TORCHHUB_ROOT = Path(__file__).parent.parent.parent / "torchhub"
+if str(_TORCHHUB_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TORCHHUB_ROOT))
+
+from zoedepth.models.builder import build_model
+from zoedepth.utils.config import get_config
 
 
 class MetricDepthEstimator:
     """
     Metric depth estimation for outdoor/indoor scenes.
-    Wraps ZoeDepth with image-to-pcd's calibration-aware backprojection.
+    Uses embedded ZoeDepth + DepthAnything backbone.
     """
     
     def __init__(self,
@@ -55,11 +48,7 @@ class MetricDepthEstimator:
         
         self.calibration = self._load_calibration(calibration_path) if calibration_path else None
         
-        if ZOE_AVAILABLE:
-            self.model = self._build_zoedepth(checkpoint_path)
-        else:
-            self.model = None
-            print("WARNING: Running without depth model. Using dummy depths.")
+        self.model = self._build_model(checkpoint_path)
         
         print(f"[DepthEstimator] Dataset: {dataset}, Device: {self.device}")
         if self.calibration:
@@ -68,8 +57,8 @@ class MetricDepthEstimator:
                   f"cx={self.calibration['cx']:.1f}, "
                   f"cy={self.calibration['cy']:.1f}")
     
-    def _build_zoedepth(self, checkpoint_path: str):
-        """Build ZoeDepth model using image-to-pcd's config system."""
+    def _build_model(self, checkpoint_path: str):
+        """Build ZoeDepth model with DepthAnything backbone."""
         config = get_config("zoedepth", "eval", self.dataset)
         
         if not checkpoint_path.startswith(('local::', 'url::')):
@@ -77,13 +66,12 @@ class MetricDepthEstimator:
         
         config.pretrained_resource = checkpoint_path
         
-        model = build_model(config)
-        model.to(self.device)
+        model = build_model(config, device=self.device)
         model.eval()
         return model
     
     def _load_calibration(self, path: str) -> Dict[str, Any]:
-        """Load image-to-pcd style calibration NPZ."""
+        """Load calibration NPZ."""
         data = np.load(path)
         K = data['Camera_matrix']
         
@@ -110,10 +98,6 @@ class MetricDepthEstimator:
         if original_size is None:
             original_size = (image.shape[1], image.shape[0])
         
-        if self.model is None:
-            h, w = original_size[1], original_size[0]
-            return np.ones((h, w), dtype=np.float32) * 10.0
-        
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(rgb)
         tensor = transforms.ToTensor()(pil).unsqueeze(0).to(self.device)
@@ -137,13 +121,6 @@ class MetricDepthEstimator:
     def backproject(self, depth_map: np.ndarray) -> np.ndarray:
         """
         Backproject depth map to 3D point cloud using camera intrinsics.
-        Uses image-to-pcd's formula: X = (u-cx)*Z/fx, Y = (v-cy)*Z/fy, Z = depth
-        
-        Args:
-            depth_map: (H, W) metric depth
-            
-        Returns:
-            points: (N, 3) array of 3D points [X_right, Y_down, Z_forward]
         """
         if self.calibration is None:
             raise ValueError("Camera calibration required for backprojection")

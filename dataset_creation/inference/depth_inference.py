@@ -1,5 +1,8 @@
+"""
+Depth inference using embedded ZoeDepth + Depth Anything.
+"""
+
 import sys
-import os
 import torch
 import numpy as np
 from pathlib import Path
@@ -8,45 +11,63 @@ from PIL import Image
 import torchvision.transforms as transforms
 import cv2
 
+_ZOEDEPTH_ROOT = Path(__file__).parent.parent.parent / "zoedepth"
+if str(_ZOEDEPTH_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ZOEDEPTH_ROOT))
+
+_TORCHHUB_ROOT = Path(__file__).parent.parent.parent / "torchhub"
+if str(_TORCHHUB_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TORCHHUB_ROOT))
+
+from zoedepth.models.builder import build_model
+from zoedepth.utils.config import get_config
+
+
 class DepthInferencer:
-    """Depth inference using Depth Anything / ZoeDepth for metric depth estimation"""
+    """Depth inference using embedded ZoeDepth for metric depth estimation"""
     
     def __init__(self, checkpoint_path: str, device: str = 'cuda', dataset: str = 'kitti',
-                 image_to_pcd_root: Optional[str] = None):
+                 calibration_path: Optional[str] = None):
         """
         Args:
             checkpoint_path: Path to the depth model checkpoint (.pt file)
             device: 'cuda' or 'cpu'
             dataset: 'kitti' for outdoor (0-80m), 'nyu' for indoor (0-10m)
-            image_to_pcd_root: Optional path to image-to-pcd module
+            calibration_path: Optional path to calibration NPZ
         """
-        self.device = device
-        self.dataset = dataset
+        self.device = device if torch.cuda.is_available() else 'cpu'
+        self.dataset = dataset.lower()
         
-        # Add the image-to-pcd path to sys.path if needed
-        if image_to_pcd_root:
-            image_to_pcd_path = Path(image_to_pcd_root)
-            if str(image_to_pcd_path) not in sys.path:
-                sys.path.insert(0, str(image_to_pcd_path))
+        self.calibration = None
+        if calibration_path:
+            self.calibration = self._load_calibration(calibration_path)
         
-        # Import zoedepth components
-        from zoedepth.models.builder import build_model
-        from zoedepth.utils.config import get_config
+        config = get_config("zoedepth", "eval", self.dataset)
         
-        # Build model configuration
-        config = get_config("zoedepth", "eval", dataset)
-        if not checkpoint_path.startswith('local::') and not checkpoint_path.startswith('url::'):
-            config.pretrained_resource = f'local::{checkpoint_path}'
-        else:
-            config.pretrained_resource = checkpoint_path
+        if not checkpoint_path.startswith(('local::', 'url::')):
+            checkpoint_path = f"local::{checkpoint_path}"
         
-        # Build and load the model
-        self.model = build_model(config)
-        self.model.to(device)
+        config.pretrained_resource = checkpoint_path
+        
+        self.model = build_model(config, device=self.device)
         self.model.eval()
         
-        print(f"Loaded depth model from {checkpoint_path}")
-        print(f"Dataset: {dataset}")
+        print(f"[DepthInferencer] Loaded depth model from {checkpoint_path}")
+        print(f"Dataset: {self.dataset}, Device: {self.device}")
+    
+    def _load_calibration(self, path: str) -> Dict[str, Any]:
+        """Load calibration NPZ."""
+        data = np.load(path)
+        K = data['Camera_matrix']
+        
+        return {
+            'camera_matrix': K,
+            'fx': float(K[0, 0]),
+            'fy': float(K[1, 1]),
+            'cx': float(K[0, 2]),
+            'cy': float(K[1, 2]),
+            'dist_coeffs': data.get('distCoeff', np.zeros(5)),
+        }
     
     def infer_depth(self, image: np.ndarray, original_size: Optional[Tuple[int, int]] = None) -> np.ndarray:
         """
@@ -60,49 +81,54 @@ class DepthInferencer:
             depth_map: numpy float32 array of shape (H, W) with depth in meters
         """
         if original_size is None:
-            original_size = (image.shape[1], image.shape[0])  # (W, H)
+            original_size = (image.shape[1], image.shape[0])
         
-        # Convert BGR to RGB if needed
         if len(image.shape) == 3 and image.shape[2] == 3:
-            # Check if BGR (OpenCV default) or RGB
-            # Assume BGR since we use OpenCV elsewhere in the project
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         else:
             image_rgb = image
         
-        # Convert to PIL Image
         pil_image = Image.fromarray(image_rgb)
-        
-        # Convert to tensor
         image_tensor = transforms.ToTensor()(pil_image).unsqueeze(0).to(self.device)
         
-        # Inference
         with torch.no_grad():
             pred = self.model(image_tensor, dataset=self.dataset)
         
-        # Handle different output formats
         if isinstance(pred, dict):
             pred = pred.get('metric_depth', pred.get('out'))
         elif isinstance(pred, (list, tuple)):
             pred = pred[-1]
         
-        # Squeeze to get numpy array
-        pred = pred.squeeze().detach().cpu().numpy()
+        depth = pred.squeeze().detach().cpu().numpy()
         
-        # Resize to original image dimensions
-        h, w = pred.shape
+        h, w = depth.shape
         orig_w, orig_h = original_size
         
-        # Only resize if dimensions differ
         if h != orig_h or w != orig_w:
-            pred_pil = Image.fromarray(pred)
-            pred_resized = np.array(
-                pred_pil.resize((orig_w, orig_h), Image.NEAREST)
-            ).astype(np.float32)
-        else:
-            pred_resized = pred.astype(np.float32)
+            depth_pil = Image.fromarray(depth)
+            depth = np.array(depth_pil.resize((orig_w, orig_h), Image.NEAREST)).astype(np.float32)
         
-        return pred_resized.astype(np.float32)
+        return depth.astype(np.float32)
+    
+    def backproject(self, depth_map: np.ndarray) -> np.ndarray:
+        """Convert depth map to point cloud using calibration."""
+        if self.calibration is None:
+            raise ValueError("Calibration required for backprojection")
+        
+        h, w = depth_map.shape
+        fx, fy = self.calibration['fx'], self.calibration['fy']
+        cx, cy = self.calibration['cx'], self.calibration['cy']
+        
+        u, v = np.meshgrid(np.arange(w), np.arange(h))
+        
+        Z = depth_map
+        X = (u - cx) * Z / fx
+        Y = (v - cy) * Z / fy
+        
+        points = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+        
+        valid = (Z.reshape(-1) > 0.1) & np.isfinite(Z.reshape(-1))
+        return points[valid]
     
     def process_frames(self, frames_dir: Path, output_dir: Path) -> Dict[str, Any]:
         """Process all frames in a directory"""
@@ -112,7 +138,6 @@ class DepthInferencer:
         
         depth_maps = {}
         
-        # Process each frame
         frame_paths = sorted(frames_dir.glob('*.jpg')) + \
                       sorted(frames_dir.glob('*.png')) + \
                       sorted(frames_dir.glob('*.jpeg'))
@@ -120,18 +145,13 @@ class DepthInferencer:
         for frame_path in frame_paths:
             print(f"Processing depth for {frame_path.name}...")
             
-            # Read image
             image = cv2.imread(str(frame_path))
             if image is None:
                 continue
             
-            # Get original size before inference
             original_size = (image.shape[1], image.shape[0])
-            
-            # Infer depth
             depth_map = self.infer_depth(image, original_size)
             
-            # Save depth map
             depth_path = output_dir / f"{frame_path.stem}_depth.npy"
             np.save(str(depth_path), depth_map)
             
