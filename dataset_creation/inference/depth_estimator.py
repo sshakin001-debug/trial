@@ -67,9 +67,10 @@ class MetricDepthEstimator:
         
         config.pretrained_resource = checkpoint_path
         
-        model = build_model(config, device=self.device)
-        model.eval()
-        return model
+        # build_model does not take device — move to device after
+        self.model = build_model(config)
+        self.model.to(self.device)
+        self.model.eval()
     
     def _load_calibration(self, path: str) -> Dict[str, Any]:
         """Load calibration NPZ."""

@@ -29,7 +29,7 @@ def load_checkpoint(checkpoint_path: str, model: nn.Module, strict: bool = False
     elif 'state_dict' in state_dict:
         state_dict = state_dict['state_dict']
     
-    model.load_state_dict(state_dict, strict=strict)
+    model.load_state_dict(state_dict, strict=False)
     return model
 
 

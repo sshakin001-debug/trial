@@ -99,6 +99,9 @@ class UnifiedBatchProcessor:
         
         ego_lane = self.fusion.compute_ego_lane(lane_markings_3d)
         
+        # Store masks for visualization
+        self._last_segformer_results = segformer_results
+
         return {
             'frame_name': frame_name,
             'image_size': {'width': w, 'height': h},
@@ -177,10 +180,25 @@ class UnifiedBatchProcessor:
         print(f"\nComplete! Output: {output_dir}")
         return all_annotations
     
-    def _visualize(self, image: np.ndarray, ann: Dict[str, Any]) -> np.ndarray:
+def _visualize(self, image: np.ndarray, ann: Dict[str, Any]) -> np.ndarray:
         """Create visualization with 3D annotations."""
         vis = image.copy()
-        
+
+        # Segformer mask overlays (same as debug_seg visualization)
+        seg = getattr(self, '_last_segformer_results', None)
+        if seg is not None:
+            pavement_overlay = np.zeros_like(vis)
+            pavement_overlay[seg['pavement_mask'] > 0] = [128, 0, 128]
+            vis = cv2.addWeighted(vis, 1.0, pavement_overlay, 0.4, 0)
+
+            lane_overlay = np.zeros_like(vis)
+            lane_overlay[seg['lane_mask'] > 0] = [0, 255, 255]
+            vis = cv2.addWeighted(vis, 1.0, lane_overlay, 0.6, 0)
+
+            lane_contours, _ = cv2.findContours(
+                seg['lane_mask'], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(vis, lane_contours, -1, (0, 255, 255), 2)
+
         for m in ann['lanes']['markings_3d']:
             s = m['start_pixel']
             e = m['end_pixel']
