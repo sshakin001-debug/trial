@@ -1,67 +1,51 @@
-"""
-Model builder for ZoeDepth.
-Handles local checkpoint loading and model construction.
-"""
+# MIT License
 
-import torch
-import torch.nn as nn
-from pathlib import Path
-from typing import Optional, Union
-import sys
+# Copyright (c) 2022 Intelligent Systems Lab Org
 
-from zoedepth.utils.config import get_config
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# File author: Shariq Farooq Bhat
+
+from importlib import import_module
 from zoedepth.models.depth_model import DepthModel
 
+def build_model(config) -> DepthModel:
+    """Builds a model from a config. The model is specified by the model name and version in the config. The model is then constructed using the build_from_config function of the model interface.
+    This function should be used to construct models for training and evaluation.
 
-def load_checkpoint(checkpoint_path: str, model: nn.Module, strict: bool = False) -> nn.Module:
-    """Load checkpoint from local path."""
-    if checkpoint_path.startswith('local::'):
-        checkpoint_path = checkpoint_path[7:]
-    
-    checkpoint_path = Path(checkpoint_path)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    
-    state_dict = torch.load(checkpoint_path, map_location='cpu')
-    
-    if 'model' in state_dict:
-        state_dict = state_dict['model']
-    elif 'state_dict' in state_dict:
-        state_dict = state_dict['state_dict']
-    
-    model.load_state_dict(state_dict, strict=False)
-    return model
-
-
-def build_model(config, device: str = 'cuda') -> DepthModel:
-    """
-    Build ZoeDepth model based on configuration.
-    
     Args:
-        config: Configuration object from get_config()
-        device: Device to load model on
-        
+        config (dict): Config dict. Config is constructed in utils/config.py. Each model has its own config file(s) saved in its root model folder.
+
     Returns:
-        DepthModel instance
+        torch.nn.Module: Model corresponding to name and version as specified in config
     """
-    model_name = config.model.get('name', 'ZoeDepth')
-    version = config.model.get('version_name', 'v1')
-    use_depth_anything = config.model.get('use_depth_anything', False)
-    
-    if use_depth_anything:
-        from zoedepth.models.zoedepth.zoedepth_v1 import ZoeDepthAnythingV1
-        model = ZoeDepthAnythingV1(config)
-    elif 'nk' in version.lower():
-        from zoedepth.models.zoedepth_nk.zoedepth_nk_v1 import ZoeDepthNKV1
-        model = ZoeDepthNKV1(config)
-    else:
-        from zoedepth.models.zoedepth.zoedepth_v1 import ZoeDepthV1
-        model = ZoeDepthV1(config)
-    
-    pretrained_resource = getattr(config, 'pretrained_resource', None)
-    if pretrained_resource:
-        model = load_checkpoint(pretrained_resource, model)
-    
-    model.to(device)
-    model.eval()
-    return model
+    module_name = f"zoedepth.models.{config.model}"
+    try:
+        module = import_module(module_name)
+    except ModuleNotFoundError as e:
+        # print the original error message
+        print(e)
+        raise ValueError(
+            f"Model {config.model} not found. Refer above error for details.") from e
+    try:
+        get_version = getattr(module, "get_version")
+    except AttributeError as e:
+        raise ValueError(
+            f"Model {config.model} has no get_version function.") from e
+    return get_version(config.version_name).build_from_config(config)

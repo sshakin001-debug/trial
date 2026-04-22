@@ -59,18 +59,14 @@ class MetricDepthEstimator:
                   f"cy={self.calibration['cy']:.1f}")
     
     def _build_model(self, checkpoint_path: str):
-        """Build ZoeDepth model with DepthAnything backbone."""
         config = get_config("zoedepth", "eval", self.dataset)
-        
         if not checkpoint_path.startswith(('local::', 'url::')):
             checkpoint_path = f"local::{checkpoint_path}"
-        
         config.pretrained_resource = checkpoint_path
-        
-        # build_model does not take device — move to device after
-        self.model = build_model(config)
+        self.model = build_model(config)  # build_model handles checkpoint loading
         self.model.to(self.device)
         self.model.eval()
+        return self.model
     
     def _load_calibration(self, path: str) -> Dict[str, Any]:
         """Load calibration NPZ."""

@@ -1,96 +1,153 @@
-"""
-Transformer blocks for DPT (Dense Prediction Transformer).
-Based on Vision Transformer with patching and DINOv2 features.
-"""
-
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
 
 
-class DPTBlock(nn.Module):
-    """
-    Single DPT block with attention and MLP.
-    """
-    
-    def __init__(self, dim, num_heads=16, mlp_ratio=4., drop=0., drop_path=0.):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=drop, batch_first=True)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, int(dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(drop),
-            nn.Linear(int(dim * mlp_ratio), dim),
-            nn.Dropout(drop)
+def _make_scratch(in_shape, out_shape, groups=1, expand=False):
+    scratch = nn.Module()
+
+    out_shape1 = out_shape
+    out_shape2 = out_shape
+    out_shape3 = out_shape
+    if len(in_shape) >= 4:
+        out_shape4 = out_shape
+
+    if expand:
+        out_shape1 = out_shape
+        out_shape2 = out_shape*2
+        out_shape3 = out_shape*4
+        if len(in_shape) >= 4:
+            out_shape4 = out_shape*8
+
+    scratch.layer1_rn = nn.Conv2d(
+        in_shape[0], out_shape1, kernel_size=3, stride=1, padding=1, bias=False, groups=groups
+    )
+    scratch.layer2_rn = nn.Conv2d(
+        in_shape[1], out_shape2, kernel_size=3, stride=1, padding=1, bias=False, groups=groups
+    )
+    scratch.layer3_rn = nn.Conv2d(
+        in_shape[2], out_shape3, kernel_size=3, stride=1, padding=1, bias=False, groups=groups
+    )
+    if len(in_shape) >= 4:
+        scratch.layer4_rn = nn.Conv2d(
+            in_shape[3], out_shape4, kernel_size=3, stride=1, padding=1, bias=False, groups=groups
         )
-        self.drop_path = nn.Identity()
-    
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0])
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
+
+    return scratch
 
 
-class DPTBlocks(nn.Module):
+class ResidualConvUnit(nn.Module):
+    """Residual convolution module.
     """
-    Stack of DPT blocks.
-    """
-    
-    def __init__(self, dim, depth, num_heads, mlp_ratio=4., drop=0., drop_path_rate=0.):
+
+    def __init__(self, features, activation, bn):
+        """Init.
+
+        Args:
+            features (int): number of features
+        """
         super().__init__()
-        self.blocks = nn.ModuleList([
-            DPTBlock(dim, num_heads, mlp_ratio, drop, drop_path_rate)
-            for _ in range(depth)
-        ])
-        self.norm = nn.LayerNorm(dim)
-    
+
+        self.bn = bn
+
+        self.groups=1
+
+        self.conv1 = nn.Conv2d(
+            features, features, kernel_size=3, stride=1, padding=1, bias=True, groups=self.groups
+        )
+        
+        self.conv2 = nn.Conv2d(
+            features, features, kernel_size=3, stride=1, padding=1, bias=True, groups=self.groups
+        )
+
+        if self.bn==True:
+            self.bn1 = nn.BatchNorm2d(features)
+            self.bn2 = nn.BatchNorm2d(features)
+
+        self.activation = activation
+
+        self.skip_add = nn.quantized.FloatFunctional()
+
     def forward(self, x):
-        for block in self.blocks:
-            x = block(x)
-        return self.norm(x)
+        """Forward pass.
+
+        Args:
+            x (tensor): input
+
+        Returns:
+            tensor: output
+        """
+        
+        out = self.activation(x)
+        out = self.conv1(out)
+        if self.bn==True:
+            out = self.bn1(out)
+       
+        out = self.activation(out)
+        out = self.conv2(out)
+        if self.bn==True:
+            out = self.bn2(out)
+
+        if self.groups > 1:
+            out = self.conv_merge(out)
+
+        return self.skip_add.add(out, x)
 
 
-class PatchEmbed(nn.Module):
+class FeatureFusionBlock(nn.Module):
+    """Feature fusion block.
     """
-    Image to Patch Embedding using conv (DINOv2 style).
-    """
-    
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
-        super().__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.grid_size = img_size // patch_size
-        
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        
-    def forward(self, x):
-        B, C, H, W = x.shape
-        x = self.proj(x)
-        x = rearrange(x, 'b c h w -> b (h w) c')
-        return x
 
+    def __init__(self, features, activation, deconv=False, bn=False, expand=False, align_corners=True, size=None):
+        """Init.
 
-class ViTAdapter(nn.Module):
-    """
-    Vision Transformer adapter for DPT.
-    """
-    
-    def __init__(self, img_size=518, patch_size=14, in_chans=3, embed_dim=1024, depth=24, num_heads=16):
-        super().__init__()
-        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
-        self.num_patches = (img_size // patch_size) ** 2
+        Args:
+            features (int): number of features
+        """
+        super(FeatureFusionBlock, self).__init__()
+
+        self.deconv = deconv
+        self.align_corners = align_corners
+
+        self.groups=1
+
+        self.expand = expand
+        out_features = features
+        if self.expand==True:
+            out_features = features//2
         
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+        self.out_conv = nn.Conv2d(features, out_features, kernel_size=1, stride=1, padding=0, bias=True, groups=1)
+
+        self.resConfUnit1 = ResidualConvUnit(features, activation, bn)
+        self.resConfUnit2 = ResidualConvUnit(features, activation, bn)
         
-        self.blocks = DPTBlocks(embed_dim, depth, num_heads)
-        
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-    
-    def forward(self, x):
-        x = self.patch_embed(x)
-        x = x + self.pos_embed
-        x = self.blocks(x)
-        return x
+        self.skip_add = nn.quantized.FloatFunctional()
+
+        self.size=size
+
+    def forward(self, *xs, size=None):
+        """Forward pass.
+
+        Returns:
+            tensor: output
+        """
+        output = xs[0]
+
+        if len(xs) == 2:
+            res = self.resConfUnit1(xs[1])
+            output = self.skip_add.add(output, res)
+
+        output = self.resConfUnit2(output)
+
+        if (size is None) and (self.size is None):
+            modifier = {"scale_factor": 2}
+        elif size is None:
+            modifier = {"size": self.size}
+        else:
+            modifier = {"size": size}
+
+        output = nn.functional.interpolate(
+            output, **modifier, mode="bilinear", align_corners=self.align_corners
+        )
+
+        output = self.out_conv(output)
+
+        return output

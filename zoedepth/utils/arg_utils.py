@@ -1,42 +1,33 @@
-"""
-Argument parsing utilities.
-"""
-
-import argparse
-from typing import List, Optional
 
 
-def get_args(description: str = "ZoeDepth inference") -> argparse.Namespace:
-    """
-    Get command line arguments for ZoeDepth.
-    """
-    parser = argparse.ArgumentParser(description=description)
-    
-    parser.add_argument('--model', type=str, default='zoedepth',
-                      help='Model name')
-    parser.add_argument('--checkpoint', type=str, required=True,
-                      help='Path to checkpoint file')
-    parser.add_argument('--dataset', type=str, default='kitti',
-                      choices=['kitti', 'nyu'],
-                      help='Dataset for depth estimation')
-    parser.add_argument('--image', type=str,
-                      help='Path to input image')
-    parser.add_argument('--output', type=str, default='depth_output.png',
-                      help='Output depth path')
-    parser.add_argument('--device', type=str, default='cuda',
-                      help='Device to run on')
-    parser.add_argument('--calibration', type=str,
-                      help='Path to calibration file')
-    
-    return parser.parse_args()
+def infer_type(x):  # hacky way to infer type from string args
+    if not isinstance(x, str):
+        return x
+
+    try:
+        x = int(x)
+        return x
+    except ValueError:
+        pass
+
+    try:
+        x = float(x)
+        return x
+    except ValueError:
+        pass
+
+    return x
 
 
-def validate_args(args: argparse.Namespace) -> bool:
-    """
-    Validate command line arguments.
-    """
-    if not args.checkpoint:
-        print("Error: --checkpoint is required")
-        return False
-    
-    return True
+def parse_unknown(unknown_args):
+    clean = []
+    for a in unknown_args:
+        if "=" in a:
+            k, v = a.split("=")
+            clean.extend([k, v])
+        else:
+            clean.append(a)
+
+    keys = clean[::2]
+    values = clean[1::2]
+    return {k.replace("--", ""): infer_type(v) for k, v in zip(keys, values)}
