@@ -49,7 +49,8 @@ class DepthInferencer:
         
         config.pretrained_resource = checkpoint_path
         
-        self.model = build_model(config, device=self.device)
+        self.model = build_model(config)
+        self.model.to(self.device)
         self.model.eval()
         
         print(f"[DepthInferencer] Loaded depth model from {checkpoint_path}")
